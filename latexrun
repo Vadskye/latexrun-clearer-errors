@@ -948,6 +948,49 @@ class LaTeX(Task):
                 self._input('unstable')
                 return True
 
+    def __find_unbalanced_environments(self, filename):
+        def strip_latex_comments(line):
+            escaped = False
+            for idx, char in enumerate(line):
+                if char == '\\':
+                    escaped = not escaped
+                elif char == '%':
+                    if not escaped:
+                        return line[:idx]
+                    escaped = False
+                else:
+                    escaped = False
+            return line
+
+        unbalanced = []
+        stack = []
+        try:
+            with open(filename, 'rt', errors='surrogateescape') as fp:
+                for idx, line in enumerate(fp):
+                    line_num = idx + 1
+                    # Strip comments
+                    content = strip_latex_comments(line)
+                    # Find all \begin{env} or \end{env}
+                    for match in re.finditer(r'\\(begin|end)\{([a-zA-Z*]+)\}', content):
+                        action, env = match.groups()
+                        if action == 'begin':
+                            stack.append((env, line_num))
+                        else: # action == 'end'
+                            if stack:
+                                expected_env, start_line = stack[-1]
+                                if expected_env == env:
+                                    stack.pop()
+                                else:
+                                    unbalanced.append((expected_env, start_line, f"\\begin{{{expected_env}}} mismatched by \\end{{{env}}} on line {line_num}"))
+                                    stack.pop()
+                            else:
+                                unbalanced.append((env, line_num, f"extra \\end{{{env}}} without \\begin"))
+        except Exception:
+            pass
+        for env, start_line in stack:
+            unbalanced.append((env, start_line, f"unclosed \\begin{{{env}}}"))
+        return unbalanced
+
     def report(self):
         extra = self._get_result_extra()
         if extra is None:
@@ -955,9 +998,24 @@ class LaTeX(Task):
 
         # Parse the log
         logfile = open(extra['jobname'] + '.log', 'rt', errors='surrogateescape')
-        for msg in self.__clean_messages(
-                LaTeXFilter(self.__nowarns).feed(
-                    logfile.read(), True).get_messages()):
+        filt = LaTeXFilter(self.__nowarns).feed(logfile.read(), True)
+        msgs = list(self.__clean_messages(filt.get_messages()))
+
+        # Check for unbalanced environments if there was a compilation error
+        if extra['status'] != 0:
+            unbalanced_msgs = []
+            for f in sorted(filt.get_seen_files()):
+                if not f or f.startswith('/') or not os.path.isfile(f):
+                    continue
+                # Skip environment definition files (typically located in the lib directory)
+                if 'lib/' in f.replace('\\', '/'):
+                    continue
+                unbalanced = self.__find_unbalanced_environments(f)
+                for env, lineno, detail in unbalanced:
+                    unbalanced_msgs.append(Message('error', f, lineno, f"unbalanced environment: {detail}"))
+            msgs.extend(unbalanced_msgs)
+
+        for msg in msgs:
             msg.emit()
 
         # Return LaTeX's exit status
@@ -1122,6 +1180,10 @@ class LaTeXFilter:
     def has_missing_includes(self):
         """Return True if the log reported missing \\include files."""
         return self.__missing_includes
+
+    def get_seen_files(self):
+        """Return the set of all files opened during the compile run."""
+        return self.__seen_files
 
     def __save_restart_point(self):
         """Save the current state as a known-good restart point.
