@@ -1063,6 +1063,8 @@ class LaTeXFilter:
         self.__missing_includes = False
         self.__pageno = 1
         self.__restart_pageno = 1
+        self.__seen_files = set()
+        self.__restart_seen_files = set()
 
         self.__suppress = {cls: 0 for cls in nowarns}
 
@@ -1079,6 +1081,7 @@ class LaTeXFilter:
         # Reset to last known-good restart point
         self.__pos = self.__restart_pos
         self.__file_stack = self.__restart_file_stack.copy()
+        self.__seen_files = self.__restart_seen_files.copy()
         self.__messages = self.__messages[:self.__restart_messages_len]
         self.__lstart = self.__lend = -1
         self.__pageno = self.__restart_pageno
@@ -1127,6 +1130,7 @@ class LaTeXFilter:
         """
         self.__restart_pos = self.__pos
         self.__restart_file_stack = self.__file_stack.copy()
+        self.__restart_seen_files = self.__seen_files.copy()
         self.__restart_messages_len = len(self.__messages)
         self.__restart_pageno = self.__pageno
 
@@ -1274,6 +1278,8 @@ class LaTeXFilter:
             first = self.__first_file is None and self.__col == 1
             filename = self.__filename()
             self.__file_stack.append(filename)
+            if filename:
+                self.__seen_files.add(filename)
             if first:
                 self.__first_file = filename
             if self.TRACE:
@@ -1389,8 +1395,39 @@ class LaTeXFilter:
                 info = info[4:]
             msg += ': '  + info.lstrip('(').rstrip(')')
 
-        self.__message('error', lineno, msg + stack_msg)
+        # Resolve the actual file if it's an unmatched environment error
+        filename = None
+        # Match standard LaTeX error for unmatched environment:
+        # e.g., "\begin{mdframed} on input line 45 ended by \end{document}."
+        m = re.search(r'\\begin\{([^}]+)\}.*on input line ([0-9]+)', msg)
+        if m:
+            env_name = m.group(1)
+            err_line = int(m.group(2))
+            resolved_file = self.__find_input_file_for_line(env_name, err_line)
+            if resolved_file:
+                filename = resolved_file
+                lineno = err_line
+
+        self.__message('error', lineno, msg + stack_msg, filename=filename)
         self.__fatal_error = True
+
+    def __find_input_file_for_line(self, env_name, line_num):
+        candidate = None
+        project_files = [f for f in self.__seen_files if f and not f.startswith('/') and os.path.isfile(f)]
+
+        for f in project_files:
+            try:
+                with open(f, 'rt', errors='surrogateescape') as fp:
+                    for idx, line in enumerate(fp):
+                        if idx + 1 == line_num:
+                            if '\\begin{' in line:
+                                if '\\begin{' + env_name + '}' in line:
+                                    return f
+                                candidate = f
+                            break
+            except Exception:
+                pass
+        return candidate
 
     def __pdftex_fail(self):
         # Procedure pdftex_fail.  Prints "\n!pdfTeX error: ", the
